@@ -1,67 +1,90 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Steam Deck Refurbished - ANY in-stock monitor (US-only)
-- Triggers a Discord alert if ANY product on the certified refurbished SALE page(s)
-  looks purchasable (broader phrase coverage). Supports multiple URLs.
+Steam Deck Refurbished (US) - ANY in-stock monitor (single URL)
+- Only monitors: https://store.steampowered.com/sale/steamdeckrefurbished/
+- To reduce false positives:
+  * Only scans <a> / <button> text and common accessibility attrs
+  * Only counts strong phrases: "Add to Cart", "Buy Now", "In Stock"
+  * Requires local context to include "Steam Deck" and "Refurbished"
+- Single-run script — perfect for GitHub Actions cron.
+
+Env:
+  DISCORD_WEBHOOK  (required)
 """
 
 import os, re, time, json, hashlib, logging, requests
 from bs4 import BeautifulSoup
 
-URLS = [
-    "https://store.steampowered.com/sale/steamdeckrefurbished/",   # correct sale path (primary)
-    "https://store.steampowered.com/steamdeckrefurbished",         # legacy path (fallback)
-]
+URL = "https://store.steampowered.com/sale/steamdeckrefurbished/"
 
 WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "").strip()
+STATE_FILE = os.path.join(os.path.dirname(__file__), ".any_instock_state.json")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
 }
 
-POSITIVE_PHRASES = [
-    r"in\s*stock",
-    r"available\s*now",
-    r"availability:\s*in\s*stock",
-    r"add\s*to\s*cart",
-    r"add\s*to\s*basket",
-    r"add\s*to\s*bag",
-    r"buy\s*now",
-    r"purchase",
-    r"checkout",
-    r"pre[-\s]*order",
-    r"reserve",
+# Strong, low-noise signals ONLY
+POSITIVE_STRICT = [
+    r"\badd\s*to\s*cart\b",
+    r"\bbuy\s*now\b",
+    r"\bin\s*stock\b",
 ]
 
-STATE_FILE = os.path.join(os.path.dirname(__file__), ".any_instock_state.json")
+NEGATIVE_HINTS = [
+    r"\bout\s*of\s*stock\b",
+    r"\bunavailable\b",
+    r"\bsold\s*out\b",
+    r"\bnotify\s*me\b",
+]
 
-def normalize_space(s: str) -> str:
-    return re.sub(r"\s+", " ", s).strip().lower()
+def norm(s: str) -> str:
+    return re.sub(r"\s+", " ", s or "").strip().lower()
 
-def has_positive_signal(soup: BeautifulSoup) -> bool:
-    page_text = normalize_space(soup.get_text(" ", strip=True))
-    for pat in POSITIVE_PHRASES:
-        if re.search(pat, page_text, flags=re.I):
+def context_looks_like_refurb(text: str) -> bool:
+    t = norm(text)
+    return ("steam deck" in t) and ("refurb" in t or "certified refurbished" in t or "refurbished" in t)
+
+def has_positive_in_context(node) -> bool:
+    """
+    Check whether this anchor/button node is a 'buy' signal with a nearby context
+    that looks like a Steam Deck refurb card.
+    """
+    texts = [norm(node.get_text(" ", strip=True))]
+    for key in ("aria-label", "title"):
+        v = node.get(key)
+        if v:
+            texts.append(norm(v))
+    combined = " ".join(texts)
+
+    # require a positive phrase
+    if not any(re.search(p, combined, flags=re.I) for p in POSITIVE_STRICT):
+        return False
+    # and NOT a negative phrase
+    if any(re.search(p, combined, flags=re.I) for p in NEGATIVE_HINTS):
+        return False
+
+    # now look at local context (walk up a few parents and grab text)
+    ctx_chunks = []
+    parent = node
+    steps = 0
+    while parent is not None and steps < 4:  # climb up to a few levels
+        try:
+            ctx_chunks.append(parent.get_text(" ", strip=True))
+        except Exception:
+            pass
+        parent = getattr(parent, "parent", None)
+        steps += 1
+    ctx = " ".join(ctx_chunks)
+
+    return context_looks_like_refurb(ctx)
+
+def detect_in_stock(soup: BeautifulSoup) -> bool:
+    # Scan buttons and links only
+    for n in soup.select("a, button"):
+        if has_positive_in_context(n):
             return True
-
-    nodes = soup.select("a, button")
-    combined = " ".join(normalize_space(n.get_text(' ', strip=True)) for n in nodes)
-    for pat in POSITIVE_PHRASES:
-        if re.search(pat, combined, flags=re.I):
-            return True
-
-    attrs_text = []
-    for n in nodes:
-        for key in ("aria-label", "title"):
-            v = n.get(key)
-            if v:
-                attrs_text.append(normalize_space(v))
-    combined_attrs = " ".join(attrs_text)
-    for pat in POSITIVE_PHRASES:
-        if re.search(pat, combined_attrs, flags=re.I):
-            return True
-
     return False
 
 def post_discord(msg: str):
@@ -97,32 +120,22 @@ def main():
     state = load_state()
     last_hash = state.get("last_hash")
 
-    triggered_url = None
-    combined_text = ""
+    # Fetch single URL
+    r = requests.get(URL, headers=HEADERS, timeout=25)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
 
-    for url in URLS:
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=25)
-            if r.status_code != 200:
-                continue
-            soup = BeautifulSoup(r.text, "html.parser")
-            if has_positive_signal(soup):
-                triggered_url = url
-            combined_text += " " + soup.get_text(" ", strip=True)
-        except Exception as e:
-            logging.warning("Fetch failed for %s: %s", url, e)
-
-    if triggered_url:
-        page_hash = hashlib.sha256(normalize_space(combined_text).encode("utf-8")).hexdigest()[:16]
+    if detect_in_stock(soup):
+        page_hash = hashlib.sha256(norm(soup.get_text(" ", strip=True)).encode("utf-8")).hexdigest()[:16]
         if page_hash != last_hash:
             ts = int(time.time())
-            post_discord(f"🎉 **Steam Deck 官翻（美区）页面出现可购买/有货信号！**\n🔗 {triggered_url}\n⏱️ <t:{ts}:F>\n\n（提示：监控已使用 /sale/steamdeckrefurbished 路径，含旧地址兜底）")
+            post_discord(f"🎉 **Steam Deck 官翻（美区）页面出现可购买/有货信号！**\n🔗 {URL}\n⏱️ <t:{ts}:F>")
             state["last_hash"] = page_hash
             save_state(state)
         else:
-            logging.info("Positive signal but same page state; skip duplicate.")
+            logging.info("Positive signal detected but page hash unchanged; skip duplicate alert.")
     else:
-        logging.info("No positive buy signal on monitored URLs.")
+        logging.info("No positive buy signal on monitored URL.")
 
 if __name__ == "__main__":
     main()
